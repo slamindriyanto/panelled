@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Panel - MQTT LED</title>
+  <style>
+    body { font-family: Arial; margin: 20px auto; max-width: 1100px; padding: 0 12px; }
+    h1 { text-align: center; margin: 0 0 12px; }
+    .bar { text-align: center; margin: 8px 0; }
+    .bar input { padding: 6px; font-size: 16px; width: 150px; }
+    .bar button { padding: 7px 14px; font-size: 15px; cursor: pointer; margin: 2px; }
+    .badge { display: inline-block; padding: 4px 12px; margin: 2px; border-radius: 12px;
+             font-size: 14px; color: white; background: #888; }
+    .badge.ok { background: #2e7d32; }
+    .badge.bad { background: #c62828; }
+    .badge.wait { background: #ef6c00; }
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+            gap: 10px; margin-top: 16px; }
+    .kartu { border: 1px solid #ccc; padding: 10px; text-align: center; }
+    .kartu.mati { opacity: .55; }
+    .kepala { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .kepala b { font-size: 17px; }
+    .tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; color: white; background: #888; }
+    .tag.ok { background: #2e7d32; }
+    .tag.bad { background: #c62828; }
+    .led { display: block; width: 100%; font-size: 17px; padding: 10px 0; margin: 5px 0;
+           border: none; color: white; cursor: pointer; background: #555; }
+    .led.on { background: #4CAF50; }
+    .led.unk { background: #999; }
+    .led:disabled { opacity: .4; cursor: not-allowed; }
+    .legend { text-align: center; font-size: 13px; color: #555; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Panel: Kontrol LED via MQTT</h1>
+
+  <div class="bar">
+    Broker: <input id="host">
+    Kode kelas: <input id="kode" placeholder="kode kelas">
+    <button onclick="connect()">Sambung</button>
+  </div>
+  <div class="bar">
+    <span id="conn" class="badge">Belum tersambung</span>
+    <span id="hitung" class="badge">ESP32 online: 0</span>
+  </div>
+  <div class="bar">
+    <button onclick="kirimSemua(['26'], '1')">Nyalakan semua LED 26</button>
+    <button onclick="kirimSemua(['26'], '0')">Matikan semua LED 26</button>
+    <button onclick="kirimSemua(['27'], '1')">Nyalakan semua LED 27</button>
+    <button onclick="kirimSemua(['27'], '0')">Matikan semua LED 27</button>
+    <button onclick="kirimSemua(['26','27'], '0')">Matikan semua LED</button>
+  </div>
+
+  <div id="grid"></div>
+  <p class="legend">Hijau = LED menyala, abu-abu gelap = mati, abu-abu muda = belum diketahui.
+    Kartu redup = ESP32 offline (perintah tetap tersimpan dan dijalankan saat ESP32 kembali online).</p>
+
+<!-- Pakai file lokal mqtt.min.js jika ada; jika tidak, ambil dari CDN -->
+<script src="mqtt.min.js"></script>
+<script>
+  if (typeof mqtt === "undefined") {
+    document.write('<script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"><\/script>');
+  }
+</script>
+
+<script>
+// ===== Pengaturan =====
+const JUMLAH_TIM = 15;      // ubah sesuai jumlah tim
+const AWALAN_TIM = "tim";   // nama grup: tim1, tim2, ... tim15
+const PINS = ["26", "27"];
+
+const tim = {};
+for (let i = 1; i <= JUMLAH_TIM; i++) {
+  tim[AWALAN_TIM + i] = { online: null, led: { "26": null, "27": null } };
+}
+let client = null;
+let kode = "";
+
+const el = id => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+let simpan = {};
+try { simpan = JSON.parse(localStorage.getItem("ledpanel") || "{}"); } catch (e) {}
+el("host").value = "broker.emqx.io";
+el("kode").value = q.get("kode") || simpan.kode || "";
+
+function buatKartu() {
+  const grid = el("grid");
+  for (const nama of Object.keys(tim)) {
+    const k = document.createElement("div");
+    k.className = "kartu";
+    k.id = "k-" + nama;
+    const kepala = document.createElement("div");
+    kepala.className = "kepala";
+    const judul = document.createElement("b");
+    judul.textContent = "Tim " + nama.slice(AWALAN_TIM.length);
+    const tag = document.createElement("span");
+    tag.id = "e-" + nama;
+    tag.className = "tag";
+    kepala.append(judul, tag);
+    k.append(kepala);
+    for (const pin of PINS) {
+      const b = document.createElement("button");
+      b.id = "b-" + nama + "-" + pin;
+      b.onclick = () => toggle(nama, pin);
+      k.append(b);
+    }
+    grid.append(k);
+  }
+}
+
+function render() {
+  const tersambung = !!(client && client.connected);
+  let jumlahOnline = 0;
+  for (const [nama, d] of Object.entries(tim)) {
+    if (d.online) jumlahOnline++;
+    el("k-" + nama).className = "kartu" + (d.online === false ? " mati" : "");
+    const tag = el("e-" + nama);
+    if (d.online === null)  { tag.textContent = "?";       tag.className = "tag"; }
+    else if (d.online)      { tag.textContent = "online";  tag.className = "tag ok"; }
+    else                    { tag.textContent = "offline"; tag.className = "tag bad"; }
+    for (const pin of PINS) {
+      const v = d.led[pin];
+      const b = el("b-" + nama + "-" + pin);
+      b.textContent = "LED " + pin + ": " + (v === null ? "?" : (v ? "ON" : "OFF"));
+      b.className = "led" + (v === null ? " unk" : (v ? " on" : ""));
+      b.disabled = !tersambung;
+    }
+  }
+  el("hitung").textContent = "ESP32 online: " + jumlahOnline + " dari " + JUMLAH_TIM;
+}
+
+function setConn(teks, kelas) {
+  const c = el("conn");
+  c.textContent = teks;
+  c.className = "badge " + kelas;
+}
+
+function connect() {
+  const host = el("host").value.trim() || "broker.emqx.io";
+  kode = el("kode").value.trim();
+  if (!kode) { setConn("Isi kode kelas dulu", "bad"); return; }
+  if (/[#+\/\s]/.test(kode)) { setConn("Kode tidak boleh berisi spasi, / + #", "bad"); return; }
+
+  if (client) client.end(true);
+  try { localStorage.setItem("ledpanel", JSON.stringify({ kode: kode })); } catch (e) {}
+  for (const d of Object.values(tim)) { d.online = null; d.led = { "26": null, "27": null }; }
+  render();
+  setConn("Menyambung...", "wait");
+
+  // Halaman HTTPS wajib wss (port 8084); halaman lokal/HTTP memakai ws (port 8083)
+  const aman = location.protocol === "https:";
+  const url = (aman ? "wss://" : "ws://") + host + ":" + (aman ? 8084 : 8083) + "/mqtt";
+  client = mqtt.connect(url, {
+    clientId: "panel-" + Math.random().toString(16).slice(2, 8),
+    reconnectPeriod: 2000
+  });
+
+  client.on("connect", () => {
+    setConn("Terhubung ke broker", "ok");
+    // Wildcard + mewakili satu level, jadi cocok untuk SEMUA tim sekaligus
+    client.subscribe([kode + "/+/led/+/status", kode + "/+/esp32/status"], { qos: 1 });
+    render();
+  });
+
+  client.on("message", (topic, msg) => {
+    const p = msg.toString();
+    // contoh topic: KODE/tim3/led/26/status  atau  KODE/tim3/esp32/status
+    const bagian = topic.split("/");
+    const nama = bagian[1];
+    if (!tim[nama]) return;
+    if (bagian[2] === "esp32" && bagian[3] === "status") {
+      tim[nama].online = (p === "online");
+    } else if (bagian[2] === "led" && bagian[4] === "status" && PINS.includes(bagian[3])) {
+      tim[nama].led[bagian[3]] = (p === "1") ? 1 : 0;
+    }
+    render();
+  });
+
+  client.on("reconnect", () => setConn("Mencoba menyambung ulang...", "wait"));
+  client.on("close", () => { setConn("Terputus dari broker", "bad"); render(); });
+  client.on("error", err => setConn("Error: " + err.message, "bad"));
+}
+
+function kirim(nama, pin, nilai) {
+  // retain=true: perintah terakhir disimpan broker, ESP32 yang baru online langsung mengikutinya
+  client.publish(kode + "/" + nama + "/led/" + pin + "/set", nilai, { qos: 1, retain: true });
+}
+
+function toggle(nama, pin) {
+  if (!client || !client.connected) return;
+  kirim(nama, pin, tim[nama].led[pin] ? "0" : "1");
+}
+
+function kirimSemua(pins, nilai) {
+  if (!client || !client.connected) return;
+  for (const nama of Object.keys(tim)) for (const pin of pins) kirim(nama, pin, nilai);
+}
+
+buatKartu();
+render();
+if (el("kode").value) connect();
+else setConn("Isi kode kelas lalu klik Sambung", "wait");
+</script>
+</body>
+</html>
